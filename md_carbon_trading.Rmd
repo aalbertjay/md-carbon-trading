@@ -1,0 +1,279 @@
+---
+title: "Carbon Trading in the State of Maryland"
+author: "Albert Wang"
+date: "5/2/2019"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(readxl)
+library(arules)
+```
+
+### Introduction
+
+Carbon trading is a government program that allows comapanies and facilities to purchase emissions credits at a set market price. Theoretically, market prices increase with time, thus increasing costs for facilities to emit pollutants, and reducing emissions gradually over time. However, the justice of carbon trading programs has been called into question in the state of California. Cushing et al. [found](https://journals.plos.org/plosmedicine/article?id=10.1371/journal.pmed.1002604) that the implementation of a cap-and-trade program actually led to increased emissions in communities of color. 
+
+This project aims to replicate Cushing et al.'s methods in the state of Maryland, my home state. 
+
+The [Regional Greenhouse Gas Initiative](https://www.rggi.org/) (RGGI) is a carbon trading program for states in the northeast and Atlantic United States. Cooperating states include Connecticut, Delaware, Maine, Maryland, Massachusetts, New Hampshire, New York, Rhode Island, and Vermont. Maryland has participated in RGGI since 2007 ([source](https://mde.maryland.gov/programs/air/climatechange/rggi/pages/index.aspx)). 
+
+### Finding Data
+
+Emissions data was collected from the website of the Environmental Protection Agency [here](https://www.epa.gov/ghgreporting/ghg-reporting-program-data-sets), under the Greenhouse Gas Reporting Program (GHGRP). Facilities reported this data to the EPA on August 19, 2018. Units for emissions data are in metric tons of carbon dioxide equivalent using GWP's from IPCC's AR4. 
+
+Additionally, We perform some basic data tidying to have the structure of our data fram conform to industry standards of tidy data, thus making it easier to work with.
+
+```{r read_emissions_data, warning=FALSE}
+emissions <- read_excel(
+  "2017_data_summary_spreadsheets/ghgp_data_by_year_8_19_2018.xlsx") %>%
+  set_tidy_names(syntactic = TRUE) %>%
+  rename(
+    zip_code = Zip.Code,
+    '2011' = X2011.Total.reported.direct.emissions,
+    '2012' = X2012.Total.reported.direct.emissions,
+    '2013' = X2013.Total.reported.direct.emissions,
+    '2014' = X2014.Total.reported.direct.emissions,
+    '2015' = X2015.Total.reported.direct.emissions,
+    '2016' = X2016.Total.reported.direct.emissions,
+    '2017' = X2017.Total.reported.direct.emissions
+  ) %>%
+  gather('2011', '2012', '2013', '2014', '2015', '2016', '2017', key = "year", value = "total_emissions")
+
+emissions$year = as.numeric(as.character(emissions$year))
+emissions$zip_code = as.numeric(as.character(emissions$zip_code))
+
+head(emissions)
+```
+
+Next, we read census data. Census data grouped by zip code was collected from Maryland's [GIS Data Catalog](https://data.imap.maryland.gov/datasets/eb706b48117b43d482c63d02017fc3ff_1?page=47&selectedAttribute=AREALAND). This dataset had very cryptic column names, so it was necessary to rename these columns into more accessible descriptors. 
+
+```{r read_census_data}
+# from https://data.imap.maryland.gov/datasets/eb706b48117b43d482c63d02017fc3ff_1
+census_data <- read_csv("Maryland_Census_Data__ZIP_Code_Tabulation_Areas_ZCTAs.csv") %>%
+  rename(
+    id = OBJECTID_1,
+    zip_code = ZCTA5CE10,
+    state_fips_code = FIRST_STAT,
+    census_id = FIRST_GEOI,
+    fips_class_code = FIRST_CLAS,
+    feature_class_code = FIRST_MTFC,
+    functional_code = FIRST_FUNC,
+    zip_code_number = ZCTA5N,
+    state = STATE, 
+    land_area = AREALAND,
+    water_area = AREAWATR,
+    population = POP100,
+    housing_units = HU100,
+    white_population = NHW,
+    black_population = NHB,
+    american_indian_population = NHAI,
+    asian_population = NHA,
+    native_hawaiian_population = NHNH,
+    other_race_population = NHO,
+    nh_total_population = NHT,
+    hispanic_population = HISP,
+    white_percentage = PNHW,
+    black_percentage = PNHB,
+    american_indian_percentage = PNHAI,
+    asian_percentage = PNHA,
+    native_hawaiian_percentage = PNHNH,
+    other_race_percentage = PNHO,
+    nh_total_percentage = PNHT,
+    hispanic_percentage = PHISP
+  )
+head(census_data)
+```
+
+### Exploratory Data Analysis
+
+The first step is to become familiar with our data. We want to focus only on data from the state of Maryland, and group longitudinal data by zip code. Next, to approach the issue from and environmental justice perspective, we want to look at emissions data in combination with racial demographics. 
+
+```{r emissions_eda, warning=FALSE}
+maryland_zip_code_data <- emissions %>%
+  filter(State == "MD") %>%
+  group_by(zip_code, year) %>%
+  summarise(emissions = sum(total_emissions))
+head(maryland_zip_code_data)
+
+maryland_zip_code_data %>%
+  ggplot(aes(year, emissions, group = zip_code, na.rm = TRUE)) + 
+  geom_point(alpha = 1/2) + 
+  geom_line(alpha = 1/3) + 
+  labs(
+    title = "Total emissions over time by zip code",
+    x = "Year",
+    y = "Total emissions (tons CO2)")
+```
+
+From the chart above, we can see that some zip code districts in particular have abnormally high emissions rates compared to the remaining zip codes. Let's find which zip codes these are:
+
+```{r find_high_polluters}
+maryland_zip_code_data %>%
+  group_by(year) %>%
+  summarise(max_emissions = max(emissions, na.rm = TRUE)) %>%
+  full_join(maryland_zip_code_data) %>%
+  filter(emissions == max_emissions)
+```
+
+The zip code with the highest emissions is 21226 - we'll find out more about the demographics of this area in the next section.
+
+Looking at census data, we want to take demographic data and calculate two new columns: `non_asian_white_population`, which represents the amount of people in each zip code who are non-Asian and non-white, and `poc_population`, which represents the amount of people of color in each zip code. `non_asian_white_percentage` and `poc_percentage` are the corresponding percentages of the total population, on a scale of 0-100. We distinguish between these two categories because it is often ambiguous (e.g. in this class) as to whether to include Asians in the broader category of people of color. 
+
+```{r census_eda}
+emissions_and_census_data <- census_data %>% 
+  select(
+    zip_code,
+    land_area,
+    water_area,
+    population,
+    housing_units,
+    white_population,
+    black_population,
+    american_indian_population,
+    asian_population,
+    native_hawaiian_population,
+    other_race_population,
+    nh_total_population,
+    hispanic_population,
+    white_percentage,
+    black_percentage,
+    american_indian_percentage,
+    asian_percentage,
+    native_hawaiian_percentage,
+    other_race_percentage,
+    nh_total_percentage,
+    hispanic_percentage
+    ) %>%
+  mutate(
+    non_asian_white_population = black_population + american_indian_population + native_hawaiian_population +  other_race_population + hispanic_population,
+    poc_population = non_asian_white_population + asian_population,
+    non_asian_white_percentage = non_asian_white_population / population * 100,
+    poc_percentage = poc_population / population * 100) %>%
+  right_join(maryland_zip_code_data, c('zip_code' = 'zip_code'))
+head(emissions_and_census_data)
+```
+
+Consider the zip code 21226, which had abnormally high levels of emissions:
+```{r outlier}
+emissions_and_census_data %>% filter(zip_code == 21226 & year == 2011) %>%
+  select(zip_code, population, non_asian_white_percentage, poc_percentage)
+
+emissions %>% filter(zip_code == 21226) %>%
+  select(Facility.Name) %>%
+  unique()
+```
+The zip code has a relatively low percentage of POC (around 20%). This zip code is located primarily in southern Baltimore - home to 4 plants that report emissions to the EPA: Brandon Shores LLC, Grace, H.A. Wagner LLC, and Quarantine Road Landfill. In 2017, these four plants together emitted about 450000 metric tons of pollutants. 
+
+Let's take a look at the previous chart again, but this time with color corresponding to the POC proportion in each zip code. 
+
+```{r warning=FALSE}
+emissions_and_census_data %>%
+  ggplot(aes(year, emissions, color = poc_percentage, group = zip_code, na.rm = TRUE, legend = FALSE)) + 
+  geom_point(alpha = 1/2) + 
+  geom_line(alpha = 1/5) + 
+  scale_color_gradient(low="orange", high="blue") + 
+  labs(
+    title = "Total emissions over time by zip code",
+    x = "Year",
+    y = "Total emissions (tons CO2)", 
+    color = "% POC")
+```
+
+Not super clear - again, a couple of high-emissions outliers hide the majority of our data. Let's see if we can fix this by grouping together zip codes with similar demographics. 
+
+``` {r}
+demographic_labels = c("very white/asian", "mostly white/asian", "somewhat white/asian", "kind of white/asian", "barely white/asian")
+
+# Group zip codes into buckets by % poc
+blocked_emissions_data <- emissions_and_census_data %>%
+  select(year, emissions, poc_percentage, non_asian_white_percentage, zip_code) %>%
+  discretizeDF(methods = list(
+    poc_percentage = list(method = "interval", breaks = 3, labels = c("low", "medium", "high")),
+    non_asian_white_percentage = list(method = "interval", breaks = 5), 
+    year = list(method = "none"),
+    emissions = list(method = "none"),
+    zip_code = list(method = "none")
+  )) %>%
+  group_by(non_asian_white_percentage, year) %>%
+  summarise(avg_emissions = mean(emissions, na.rm = TRUE))
+```
+
+And the same plot again (NA represents zip codes without demographic data):
+
+```{r}
+blocked_emissions_data %>%
+  ggplot(aes(year, avg_emissions, color = non_asian_white_percentage, group = non_asian_white_percentage, na.rm = TRUE)) +
+  geom_point(alpha = 1/2) +
+  geom_line(alpha = 1/2) +
+  labs(
+    title = "Total emissions over time by proportion POC",
+    x = "Year",
+    y = "Average total emissions (tons CO2)", 
+    color = "% POC")
+```
+
+### Regression
+
+Using these 5 bins of racial diversity, we can compute 5 different linear regressions. We want to look at the relationship between how diverse a zip code is, and the rates at which their emissions levels are changing.
+
+```{r bucketed_regression}
+diversity_buckets <- unique(blocked_emissions_data$non_asian_white_percentage)
+diversity_buckets <- diversity_buckets[1:(length(diversity_buckets)-1)]
+
+regressions <- vector(mode="list", 5)
+slopes <- vector(mode="list", 5)
+
+for (i in seq_along(diversity_buckets)) {
+  single_bucket_data <- filter(blocked_emissions_data, non_asian_white_percentage == diversity_buckets[[i]])
+  regressions[[i]] <- lm(avg_emissions ~ year, data = single_bucket_data)
+  slopes[[i]] <- coef(regressions[[i]])["year"]
+}
+```
+
+In fact, we no longer have to rely on binning our data to create meaningful charts. 
+
+```{r continuous_regression, warning=FALSE}
+emissions_and_census_data_diversity <- emissions_and_census_data %>%
+  filter(!is.nan(emissions) & !is.na(non_asian_white_percentage))
+  
+diversity_buckets <- unique(emissions_and_census_data_diversity$non_asian_white_percentage)
+
+regressions <- vector(mode="list", length(diversity_buckets))
+slopes <- vector(mode="integer", length(diversity_buckets))
+
+for (i in seq_along(diversity_buckets)) {
+  single_bucket_data <- filter(
+    emissions_and_census_data_diversity, 
+    non_asian_white_percentage == diversity_buckets[[i]] & !is.na(emissions))
+  regressions[[i]] <- lm(emissions ~ year, data = single_bucket_data)
+  slopes[i] <- coef(regressions[[i]])["year"]
+}
+
+emissions_and_census_data_diversity$slope <- slopes
+emissions_and_census_data_diversity %>%
+  filter(year == 2011) %>%
+  ggplot(aes(non_asian_white_percentage, slope, na.rm = TRUE)) +
+  geom_point(alpha = 1/2) +
+  geom_smooth() + 
+  labs(
+    title = "Total emissions over time by proportion POC",
+    x = "% POC",
+    y = "Slope of regression")
+```
+
+According to local polynomial regression, the more diverse a zip code is, the faster emissions are predicted to decrease. 
+
+### Conclusions
+
+This analysis shows that more diverse communities and communities with higher proportions of people of color are predicted to have faster improvments in nearby emissions data after the implementation of RGGI. These results stand at odds with Cushing et al.'s findings, which stated that communites with majority POC populations were likely to see emissions increase after cap and trade in California. 
+
+There are multiple reasons for this discrepancy. The data in this study only ranged from 2011 - 2017, which was four years after RGGI started in Maryland. Therefore, the immediate effects of cap and trade are not highly visible in this analysis. Next, geographical data points were only split by zip code. A finer split of geographical area, such as census tract, could have more accurately grouped together communities of color. 
+
+However, there is still value to the datasets engineered in this study. As far as I know, this is the first comprehensive dataset in Maryland that combines demographic data with environmental indicators in a single table, making further analysis much more accessible to other researchers. 
+
+Overall, the results of this study present an optimistic outlook for both environmental justice and climate change. 
